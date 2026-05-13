@@ -592,7 +592,7 @@ ADLS Gen2 access is controlled through **Shared Access Signature (SAS) tokens**:
 
 ### Power BI — Management Analytics
 
-![Power BI Dashboard](images/powerbi.png)
+![Power BI Dashboard](powerbi.png)
 
 Connected to Snowflake Gold layer Views using Snowflake's native Power BI connector in DirectQuery mode.
 
@@ -613,7 +613,7 @@ Connected to Snowflake Gold layer Views using Snowflake's native Power BI connec
 
 ### Streamlit — Real-Time Monitoring
 
-![Streamlit App](images/streamlit.png)
+![Streamlit App](streamlit.png)
 
 A lightweight Python web application connected directly to Snowflake using the Snowflake Python connector.
 
