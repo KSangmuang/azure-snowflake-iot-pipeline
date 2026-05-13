@@ -169,10 +169,6 @@ flowchart TB
     SECURITY -.-> SNOWFLAKE
     SECURITY -.-> AZURE
 ```
-
-<!-- TODO: Add architecture image -->
-![Architecture Diagram](images/architecture.png)
-
 ### How It Works
 
 The system has two parallel ingestion paths that converge in Snowflake:
@@ -276,10 +272,6 @@ flowchart LR
 
     BRONZE -->|Incremental<br/>Refresh| SILVER -->|Lightweight<br/>Aggregation| GOLD
 ```
-
-<!-- TODO: Add medallion diagram -->
-![Medallion Layers](images/medallion.png)
-
 #### Bronze — Raw Landing Zone (ADLS Gen2)
 
 ```
