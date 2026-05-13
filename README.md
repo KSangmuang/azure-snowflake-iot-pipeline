@@ -117,19 +117,23 @@ flowchart TB
     end
 
     subgraph SNOWFLAKE["❄️ Snowflake"]
-        subgraph BRONZE_SF["Bronze — Landing Tables"]
-            RAW_BATCH[raw_sensor_batch]
+        subgraph BATCH_SF["Batch Side"]
+            RAW_BATCH[raw_sensor_batch<br/>Pre-cleaned by ADF]
+            subgraph BATCH_GOLD["Gold — Views"]
+                V1[v_sensor_summary_hourly]
+                V4[v_sensor_daily_stats]
+                V5[v_device_health]
+            end
+        end
+        subgraph STREAM_SF["Stream Side"]
             RAW_STREAM[raw_sensor_stream]
-        end
-        subgraph SILVER_SF["Silver — Dynamic Tables"]
-            DT[dt_sensor_clean<br/>Cleaned, Typed, Deduplicated]
-        end
-        subgraph GOLD_SF["Gold — Views"]
-            V1[v_sensor_summary_hourly]
-            V2[v_sensor_latest]
-            V3[v_threshold_alerts]
-            V4[v_sensor_daily_stats]
-            V5[v_device_health]
+            subgraph SILVER_SF["Silver — Dynamic Table"]
+                DT[dt_sensor_clean<br/>Cleaned, Typed, Deduplicated]
+            end
+            subgraph STREAM_GOLD["Gold — Views"]
+                V2[v_sensor_latest]
+                V3[v_threshold_alerts]
+            end
         end
         PIPE[Snowpipe<br/>Auto-Ingest]
     end
@@ -149,17 +153,16 @@ flowchart TB
     CSV --> BATCH_CONTAINER
     JSON --> STREAM_CONTAINER
     BATCH_CONTAINER --> ADF
-    ADF -->|COPY INTO| RAW_BATCH
+    ADF -->|COPY INTO<br/>Pre-cleaned| RAW_BATCH
     STREAM_CONTAINER --> EG
     EG --> PIPE
     PIPE -->|COPY INTO| RAW_STREAM
-    RAW_BATCH --> DT
+    RAW_BATCH --> V1
+    RAW_BATCH --> V4
+    RAW_BATCH --> V5
     RAW_STREAM --> DT
-    DT --> V1
     DT --> V2
     DT --> V3
-    DT --> V4
-    DT --> V5
     V1 --> PBI
     V4 --> PBI
     V5 --> PBI
@@ -169,13 +172,14 @@ flowchart TB
     SECURITY -.-> SNOWFLAKE
     SECURITY -.-> AZURE
 ```
+
 ### How It Works
 
 The system has two parallel ingestion paths that converge in Snowflake:
 
 **Batch Path (CSV):**
 ```
-CSV files → ADLS Gen2 (Bronze container) → Azure Data Factory (scheduled) → Snowflake Landing Table → Dynamic Tables (Silver) → Views (Gold) → Power BI
+CSV files → ADLS Gen2 (Bronze container) → Azure Data Factory (scheduled, clean + transform) → Snowflake Landing Table (pre-cleaned) → Views (Gold) → Power BI
 ```
 
 **Stream Path (JSON):**
@@ -183,7 +187,7 @@ CSV files → ADLS Gen2 (Bronze container) → Azure Data Factory (scheduled) �
 JSON files → ADLS Gen2 (Bronze container) → Snowpipe (auto-ingest via Event Grid) → Snowflake Landing Table → Dynamic Tables (Silver) → Views (Gold) → Streamlit
 ```
 
-Both paths share the same Silver and Gold layer design — the only difference is how data enters the Bronze layer.
+Both paths end at Gold layer Views, but the cleaning happens at different stages — ADF handles it for batch before data reaches Snowflake, while Dynamic Tables handle it for stream inside Snowflake.
 
 ### Why Two Paths?
 
@@ -272,6 +276,9 @@ flowchart LR
 
     BRONZE -->|Incremental<br/>Refresh| SILVER -->|Lightweight<br/>Aggregation| GOLD
 ```
+
+
+
 #### Bronze — Raw Landing Zone (ADLS Gen2)
 
 ```
@@ -294,9 +301,11 @@ adls-gen2-account/
 - Organized by date for batch, flat for stream (Snowpipe handles ordering)
 - Retention: keep everything (storage is cheap, reprocessing is expensive)
 
-#### Silver — Cleaned and Validated (Snowflake Dynamic Tables)
+#### Silver — Cleaned and Validated (Snowflake Dynamic Tables — Stream Path Only)
 
-Silver is where data gets cleaned. Dynamic Tables handle this incrementally — only processing new rows, not rescanning the full table every time.
+Silver is where **stream data** gets cleaned. Dynamic Tables handle this incrementally — only processing new rows, not rescanning the full table every time.
+
+Batch data skips this layer because ADF already handles cleaning during ingestion — there's no point cleaning twice.
 
 **Transformations applied:**
 - Data type casting (strings → proper floats, timestamps)
@@ -344,13 +353,12 @@ flowchart LR
     end
 
     subgraph INGESTION["⚙️ Ingestion"]
-        ADF[Azure Data Factory<br/>Scheduled Trigger]
+        ADF[Azure Data Factory<br/>Scheduled Trigger<br/>Clean + Transform]
     end
 
     subgraph SNOWFLAKE["❄️ Snowflake"]
-        RAW[raw_sensor_batch<br/>Landing Table]
-        SILVER[dt_sensor_clean<br/>Dynamic Table — Silver]
-        GOLD[Views — Gold]
+        RAW[raw_sensor_batch<br/>Pre-cleaned Landing Table]
+        GOLD[Views — Gold<br/>Analytics-Ready]
     end
 
     subgraph REPORTING["📊 Reporting"]
@@ -359,14 +367,12 @@ flowchart LR
 
     CSV --> ADLS
     ADLS --> ADF
-    ADF -->|COPY INTO| RAW
-    RAW -->|Incremental Refresh| SILVER
-    SILVER --> GOLD
+    ADF -->|COPY INTO<br/>Pre-cleaned| RAW
+    RAW --> GOLD
     GOLD --> PBI
 ```
 
-<!-- TODO: Add batch pipeline screenshot -->
-![Batch Pipeline](images/batch_pipeline.png)
+
 
 #### How It Works
 
@@ -374,9 +380,9 @@ flowchart LR
 |------|-----------|-------------|
 | 1 | ADF Trigger | Scheduled trigger fires (configurable — hourly, daily, etc.) |
 | 2 | ADF Pipeline | Picks up new CSV files from ADLS Gen2 Bronze container |
-| 3 | Copy Activity | Loads CSV data into Snowflake landing table via COPY INTO |
-| 4 | Dynamic Table | Silver layer picks up new rows automatically |
-| 5 | Views | Gold layer reflects updated Silver data immediately |
+| 3 | ADF Data Flow | Cleans, transforms, and validates data before loading |
+| 4 | Copy Activity | Loads pre-cleaned data into Snowflake landing table via COPY INTO |
+| 5 | Views | Gold layer Views read directly from landing table |
 | 6 | Power BI | DirectQuery reads from Gold Views |
 
 #### ADF Pipeline Design
@@ -439,8 +445,7 @@ flowchart LR
     GOLD2 --> ST
 ```
 
-<!-- TODO: Add stream pipeline screenshot -->
-![Stream Pipeline](images/stream_pipeline.png)
+
 
 #### How It Works
 
@@ -492,33 +497,35 @@ For most manufacturing monitoring use cases (SPC charts, OEE dashboards, shift r
 | `ff_csv_sensor` | File Format | Parses CSV sensor data |
 | `ff_json_sensor` | File Format | Parses JSON sensor events |
 | `pipe_sensor_stream` | Snowpipe | Auto-ingest for JSON stream path |
-| `raw_sensor_batch` | Table | Bronze landing for batch CSV data |
-| `raw_sensor_stream` | Table | Bronze landing for stream JSON data |
-| `dt_sensor_clean` | Dynamic Table | Silver — cleaned, typed, deduplicated |
-| `v_sensor_summary_hourly` | View | Gold — hourly aggregation |
-| `v_sensor_latest` | View | Gold — latest reading per device |
-| `v_threshold_alerts` | View | Gold — threshold breach alerts |
-| `v_sensor_daily_stats` | View | Gold — daily statistics |
-| `v_device_health` | View | Gold — device uptime monitoring |
+| `raw_sensor_batch` | Table | Landing table for batch CSV data (pre-cleaned by ADF) |
+| `raw_sensor_stream` | Table | Landing table for stream JSON data (raw) |
+| `dt_sensor_clean` | Dynamic Table | Silver — cleans stream data only (typed, deduplicated) |
+| `v_sensor_summary_hourly` | View | Gold — hourly aggregation (reads from batch) |
+| `v_sensor_latest` | View | Gold — latest reading per device (reads from stream Silver) |
+| `v_threshold_alerts` | View | Gold — threshold breach alerts (reads from stream Silver) |
+| `v_sensor_daily_stats` | View | Gold — daily statistics (reads from batch) |
+| `v_device_health` | View | Gold — device uptime monitoring (reads from batch) |
 
-### Why Separate Landing Tables?
+### Why Different Transformation Strategies?
 
-Batch and stream data land in separate tables (`raw_sensor_batch` and `raw_sensor_stream`) instead of one shared table because:
+The batch and stream paths handle cleaning differently:
 
-- **Different schemas** — CSV has flat columns, JSON is nested and needs flattening
-- **Different ingestion patterns** — batch loads in bulk, stream loads row-by-row
-- **Failure isolation** — a Snowpipe error doesn't block batch loading (and vice versa)
-- **Monitoring** — easier to track ingestion health per path
+| Aspect | Batch Path | Stream Path |
+|--------|-----------|-------------|
+| **Where cleaning happens** | ADF (before Snowflake) | Dynamic Table (inside Snowflake) |
+| **Why** | ADF Data Flow can transform during copy — no need to land raw then clean again | Snowpipe does COPY INTO only — cannot transform during ingestion |
+| **Landing table state** | Pre-cleaned, typed, validated | Raw JSON, needs parsing and cleaning |
+| **Path to Gold** | Landing table → Views directly | Landing table → Dynamic Table (Silver) → Views |
 
-The Silver Dynamic Table reads from **both** landing tables, merging them into a single clean dataset. This is where the two paths converge.
+This is a deliberate design choice — use each tool's strength. ADF is an orchestrator that can transform. Snowpipe is a loader that just copies. So the cleaning logic lives where it makes sense.
 
-### Dynamic Table Refresh
+### Dynamic Table Refresh (Stream Path Only)
 
 Dynamic Tables in Snowflake have a configurable refresh lag — the maximum allowed staleness before Snowflake triggers an incremental refresh.
 
 For this project:
-- Silver Dynamic Table: **5 minute** target lag (balance between freshness and compute cost)
-- In production, this would be tuned based on actual monitoring requirements
+- Silver Dynamic Table (`dt_sensor_clean`): **5 minute** target lag
+- Only applies to the stream path — batch data is already clean when it lands
 
 The key advantage over traditional ETL scheduling is that Dynamic Tables are **dependency-aware** — if upstream data hasn't changed, they don't recompute. This eliminates wasted compute cycles.
 
@@ -585,7 +592,6 @@ ADLS Gen2 access is controlled through **Shared Access Signature (SAS) tokens**:
 
 ### Power BI — Management Analytics
 
-<!-- TODO: Add Power BI dashboard screenshot -->
 ![Power BI Dashboard](images/powerbi.png)
 
 Connected to Snowflake Gold layer Views using Snowflake's native Power BI connector in DirectQuery mode.
@@ -607,7 +613,6 @@ Connected to Snowflake Gold layer Views using Snowflake's native Power BI connec
 
 ### Streamlit — Real-Time Monitoring
 
-<!-- TODO: Add Streamlit app screenshot -->
 ![Streamlit App](images/streamlit.png)
 
 A lightweight Python web application connected directly to Snowflake using the Snowflake Python connector.
@@ -727,10 +732,8 @@ Moving to the cloud doesn't automatically solve data platform problems. A poorly
 >
 > | Filename | Description |
 > |----------|-------------|
-> | `architecture.png` | Full end-to-end architecture diagram |
-> | `medallion.png` | Bronze / Silver / Gold layer diagram |
-> | `batch_pipeline.png` | ADF pipeline screenshot or diagram |
-> | `stream_pipeline.png` | Snowpipe flow screenshot or diagram |
+> | `adf_pipeline.png` | Azure Data Factory pipeline in Azure portal |
+> | `snowflake_objects.png` | Snowflake console showing tables, stages, pipes |
 > | `powerbi.png` | Power BI dashboard screenshot |
 > | `streamlit.png` | Streamlit app screenshot |
 
